@@ -109,6 +109,14 @@ def verification(c,airport):
     return pd.DataFrame(rows)
 
 st.set_page_config(page_title="Aviation Weather Intelligence",page_icon="✈️",layout="wide")
+st.markdown("""<style>
+.block-container{max-width:1050px;padding-top:1.2rem;padding-bottom:2rem}
+h1{font-size:clamp(2rem,6vw,3.2rem)!important;line-height:1.15!important}
+h2,h3{letter-spacing:-.02em}
+div[data-testid="stMetric"]{background:rgba(125,145,180,.09);border:1px solid rgba(125,145,180,.20);border-radius:14px;padding:14px}
+div[data-testid="stAlert"]{border-radius:12px}
+.stButton button[kind="primary"]{border-radius:12px;font-weight:650}
+</style>""",unsafe_allow_html=True)
 st.title("✈️ Aviation Weather Intelligence")
 st.caption("30-hour experimental aviation forecast dashboard · not an official TAF service")
 airport=st.sidebar.selectbox("Airport",list(AIRPORTS),format_func=lambda a:a+" — "+AIRPORTS[a][0])
@@ -120,8 +128,15 @@ if st.sidebar.button("Refresh live weather",type="primary"):
         st.session_state["last_"+airport]=datetime.now(timezone.utc).isoformat()
 st.subheader(airport+" — "+AIRPORTS[airport][0])
 st.caption("Last refresh: "+st.session_state.get("last_"+airport,"Not refreshed this session"))
+st.markdown("### Current airport overview")
 obs=pd.read_sql_query("SELECT * FROM observations WHERE airport=? ORDER BY observed_at DESC LIMIT 1",c,params=(airport,))
 taf=pd.read_sql_query("SELECT * FROM tafs WHERE airport=? ORDER BY fetched_at DESC LIMIT 1",c,params=(airport,))
+if not obs.empty:
+    current=obs.iloc[0]
+    m1,m2,m3=st.columns(3)
+    m1.metric("Temperature",f"{current['temp']:.0f} °C" if pd.notna(current['temp']) else "N/A")
+    m2.metric("Wind",f"{current['wind_kt']:.0f} kt" if pd.notna(current['wind_kt']) else "N/A")
+    m3.metric("Station",airport)
 left,right=st.columns(2)
 with left:
     st.markdown("#### Latest archived METAR")
@@ -142,6 +157,31 @@ else:
     selected["valid_at"]=pd.to_datetime(selected.valid_at,utc=True)
     st.line_chart(selected.pivot_table(index="valid_at",columns="model",values="value"))
     st.dataframe(selected[["model","valid_at","value"]],hide_index=True,use_container_width=True)
+st.markdown("---")
+st.markdown("## 📝 Generate a TAF planning draft")
+st.caption("Choose a local Central Time start date and hour. The app uses available model guidance to create a conservative 3-hourly planning outline. It does not invent missing sky layers or weather phenomena.")
+tz=ZoneInfo("America/Chicago")
+local_now=datetime.now(tz)
+with st.form("generate_taf"):
+    a,b=st.columns(2)
+    with a:
+        chosen_date=st.date_input("Forecast start date (Central Time)",value=local_now.date(),key="draft_date")
+    with b:
+        chosen_hour=st.selectbox("Forecast start hour (Central Time)",list(range(24)),index=local_now.hour,format_func=lambda h:f"{h:02d}:00",key="draft_hour")
+    duration=st.selectbox("Requested duration",options=[6,12,18,24,30],index=3,format_func=lambda h:f"{h} hours")
+    make=st.form_submit_button("Generate draft from model guidance",type="primary",use_container_width=True)
+if make:
+    selected_local=datetime.combine(chosen_date,time(chosen_hour),tzinfo=tz)
+    draft_text,warnings=build_draft(airport,f,selected_local.astimezone(timezone.utc),duration)
+    st.session_state["generated_"+airport]=draft_text
+    st.session_state["warnings_"+airport]=warnings
+generated=st.session_state.get("generated_"+airport)
+if generated:
+    st.code(generated,language=None)
+    st.download_button("Download planning draft",data=generated,file_name=f"{airport}_planning_draft.txt",mime="text/plain")
+for warning in st.session_state.get("warnings_"+airport,[]):
+    st.caption("⚠️ "+warning)
+st.markdown("---")
 st.markdown("### Forecast verification")
 scores=verification(c,airport)
 if scores.empty:st.info("Collect multiple refreshes over time to match past forecasts against subsequent METARs.")
@@ -152,7 +192,7 @@ else:
 st.markdown("### Internal TAF review workspace")
 st.warning("Human-reviewed drafts only. This app does not issue or automatically amend official TAFs.")
 with st.form("review"):
-    draft=st.text_area("Draft TAF text",value=taf.iloc[0]["raw"] if not taf.empty else "",height=110)
+    draft=st.text_area("Draft TAF text",value=st.session_state.get("generated_"+airport) or (taf.iloc[0]["raw"] if not taf.empty else ""),height=110)
     rationale=st.text_area("Review rationale")
     if st.form_submit_button("Save internal review"):
         if draft.strip():
