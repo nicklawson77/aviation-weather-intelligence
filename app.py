@@ -4,6 +4,10 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+import plotly.express as px
+from datetime import date, time, timedelta
+from zoneinfo import ZoneInfo
+from taf_generator import build_draft
 
 AIRPORTS={"KDLF":("Laughlin AFB",29.3594,-100.7779),"KAUS":("Austin-Bergstrom",30.1975,-97.6664)}
 MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless"}
@@ -117,11 +121,12 @@ div[data-testid="stMetric"]{background:rgba(125,145,180,.09);border:1px solid rg
 div[data-testid="stAlert"]{border-radius:12px}
 .stButton button[kind="primary"]{border-radius:12px;font-weight:650}
 </style>""",unsafe_allow_html=True)
+st.markdown("""<style>.block-container{max-width:1050px;padding-top:1.2rem}h1{font-size:clamp(2rem,6vw,3rem)!important}div[data-testid="stMetric"]{border:1px solid #52607355;border-radius:12px;padding:12px}</style>""",unsafe_allow_html=True)
 st.title("✈️ Aviation Weather Intelligence")
 st.caption("30-hour experimental aviation forecast dashboard · not an official TAF service")
 airport=st.sidebar.selectbox("Airport",list(AIRPORTS),format_func=lambda a:a+" — "+AIRPORTS[a][0])
 c=connect()
-if st.sidebar.button("Refresh live weather",type="primary"):
+if st.sidebar.button("Refresh live weather",type="primary") or ("last_"+airport not in st.session_state):
     with st.spinner("Collecting METAR, TAF and model forecasts..."):
         metars,tafs,errors=ingest(c,airport)
         st.session_state["errors_"+airport]=errors
@@ -155,7 +160,10 @@ else:
     variable=st.selectbox("Forecast variable",FIELDS)
     selected=f[f.variable==variable].copy()
     selected["valid_at"]=pd.to_datetime(selected.valid_at,utc=True)
-    st.line_chart(selected.pivot_table(index="valid_at",columns="model",values="value"))
+    fig=px.line(selected.sort_values("valid_at"),x="valid_at",y="value",color="model",markers=True)
+    if variable in ("cloud_cover","precipitation_probability"):fig.update_yaxes(range=[0,100])
+    fig.update_layout(height=360,margin=dict(l=5,r=5,t=10,b=5),hovermode="x unified")
+    st.plotly_chart(fig,use_container_width=True)
     st.dataframe(selected[["model","valid_at","value"]],hide_index=True,use_container_width=True)
 st.markdown("---")
 st.markdown("## 📝 Generate a TAF planning draft")
@@ -170,6 +178,28 @@ with st.form("generate_taf"):
         chosen_hour=st.selectbox("Forecast start hour (Central Time)",list(range(24)),index=local_now.hour,format_func=lambda h:f"{h:02d}:00",key="draft_hour")
     duration=st.selectbox("Requested duration",options=[6,12,18,24,30],index=3,format_func=lambda h:f"{h} hours")
     make=st.form_submit_button("Generate draft from model guidance",type="primary",use_container_width=True)
+if make:
+    selected_local=datetime.combine(chosen_date,time(chosen_hour),tzinfo=tz)
+    draft_text,warnings=build_draft(airport,f,selected_local.astimezone(timezone.utc),duration)
+    st.session_state["generated_"+airport]=draft_text
+    st.session_state["warnings_"+airport]=warnings
+generated=st.session_state.get("generated_"+airport)
+if generated:
+    st.code(generated,language=None)
+    st.download_button("Download planning draft",data=generated,file_name=f"{airport}_planning_draft.txt",mime="text/plain")
+for warning in st.session_state.get("warnings_"+airport,[]):
+    st.caption("⚠️ "+warning)
+st.markdown("---")
+st.markdown("---")
+st.markdown("## 📝 Generate a TAF planning draft")
+st.caption("Select a forecast start in Central Time. This creates an experimental 3-hourly planning outline, not an official TAF.")
+tz=ZoneInfo("America/Chicago")
+local_now=datetime.now(tz)
+with st.form("generate_taf"):
+    chosen_date=st.date_input("Start date (Central Time)",value=local_now.date())
+    chosen_hour=st.selectbox("Start hour (Central Time)",list(range(24)),index=local_now.hour,format_func=lambda h:f"{h:02d}:00")
+    duration=st.selectbox("Duration",options=[6,12,18,24,30],index=3,format_func=lambda h:f"{h} hours")
+    make=st.form_submit_button("Generate planning draft",type="primary",use_container_width=True)
 if make:
     selected_local=datetime.combine(chosen_date,time(chosen_hour),tzinfo=tz)
     draft_text,warnings=build_draft(airport,f,selected_local.astimezone(timezone.utc),duration)
