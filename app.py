@@ -1,235 +1,204 @@
-import json, math, sqlite3
+"""KDLF cloud intelligence deployment.
+
+Run with: streamlit run app.py
+Main Streamlit entrypoint; experimental aviation planning only.
+"""
 from datetime import datetime, timezone
-from pathlib import Path
+import re
 import pandas as pd
 import requests
 import streamlit as st
 import plotly.express as px
-from datetime import date, time, timedelta
-from zoneinfo import ZoneInfo
-from taf_generator import build_draft
+from station_config import active_station
+from vertical_profile import LEVELS, saturated_level_candidates, lowest_candidate_ft
+from feed_quality import model_field_status
+from moisture_bands import moisture_bands
+from planning_outline import planning_outline
+from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
-AIRPORTS={"KDLF":("Laughlin AFB",29.3594,-100.7779),"KAUS":("Austin-Bergstrom",30.1975,-97.6664)}
-MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless"}
-FIELDS=["temperature_2m","dew_point_2m","wind_speed_10m","wind_direction_10m","wind_gusts_10m","visibility","cloud_cover","precipitation_probability"]
-HEADERS={"User-Agent":"AviationWeatherIntelligenceResearch/0.3"}
-DB=Path(__file__).with_name("weather.sqlite3")
+STATION=active_station()
+MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless","HRRR":"ncep_hrrr_conus","RRFS":"ncep_rrfs_conus"}
+CLOUD_FIELDS=["cloud_cover","cloud_cover_low","cloud_cover_mid","cloud_cover_high"]
+HEADERS={"User-Agent":"AviationWeatherIntelligenceResearch/0.4"}
+PROFILE_FIELDS=[f"{field}_{level}hPa" for level in LEVELS for field in ("relative_humidity","geopotential_height")]
 
-def connect():
-    c=sqlite3.connect(DB)
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS observations(airport TEXT,observed_at TEXT,raw TEXT,temp REAL,wind_kt REAL,PRIMARY KEY(airport,observed_at,raw));
-    CREATE TABLE IF NOT EXISTS forecasts(airport TEXT,model TEXT,fetched_at TEXT,valid_at TEXT,variable TEXT,value REAL,PRIMARY KEY(airport,model,fetched_at,valid_at,variable));
-    CREATE TABLE IF NOT EXISTS tafs(airport TEXT,fetched_at TEXT,raw TEXT);
-    CREATE TABLE IF NOT EXISTS reviews(airport TEXT,created_at TEXT,draft TEXT,rationale TEXT);
-    """)
-    return c
+def fetch(url,params):
+    response=requests.get(url,params=params,headers=HEADERS,timeout=25)
+    response.raise_for_status()
+    return response.json()
 
-def request_json(url,params):
-    r=requests.get(url,params=params,headers=HEADERS,timeout=30)
-    if r.status_code==204:return []
-    r.raise_for_status()
-    return r.json()
-
-def asfloat(x):
-    try:return float(x)
-    except (TypeError,ValueError):return None
-
-def timestamp(v):
-    if isinstance(v,(float,int)):return datetime.fromtimestamp(v,timezone.utc).isoformat()
-    if not v:return None
-    try:return datetime.fromisoformat(str(v).replace("Z","+00:00")).astimezone(timezone.utc).isoformat()
-    except ValueError:return None
-
-def ingest(c,airport):
-    now=datetime.now(timezone.utc).isoformat()
+@st.cache_data(ttl=900,show_spinner=False)
+def model_data():
+    records=[]
     errors=[]
-    metars=[];tafs=[]
-    for kind in ("metar","taf"):
+    statuses=[]
+    for name,model in MODELS.items():
         try:
-            data=request_json("https://aviationweather.gov/api/data/"+kind,{"ids":airport,"format":"json"})
-            if not isinstance(data,list):data=[]
-            if kind=="metar":metars=data
-            else:tafs=data
-        except Exception as e:errors.append(kind+": "+str(e))
-    for m in metars:
-        raw=m.get("rawOb") or json.dumps(m)
-        observed=timestamp(m.get("obsTime"))
-        if observed:
-            c.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?)",
-                      (airport,observed,raw,asfloat(m.get("temp")),asfloat(m.get("wspd"))))
-    for t in tafs:
-        c.execute("INSERT INTO tafs VALUES(?,?,?)",(airport,now,t.get("rawTAF") or json.dumps(t)))
-    for name,code in MODELS.items():
+            data=fetch("https://api.open-meteo.com/v1/forecast",{
+                "latitude":STATION["latitude"],"longitude":STATION["longitude"],
+                "models":model,"hourly":",".join(CLOUD_FIELDS),
+                "forecast_days":2,"timezone":"UTC"})
+            hourly=data.get("hourly",{})
+            statuses.append({"Model":name,**model_field_status(hourly,CLOUD_FIELDS)})
+            times=hourly.get("time",[])
+            for i,t in enumerate(times):
+                record={"valid_at":pd.to_datetime(t,utc=True),"model":name}
+                for field in CLOUD_FIELDS:
+                    values=hourly.get(field,[])
+                    record[field]=values[i] if i<len(values) else None
+                records.append(record)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            statuses.append({"Model":name,"status":"error","hours":0,"available":[],"missing":CLOUD_FIELDS})
+    return pd.DataFrame(records),errors,pd.DataFrame(statuses)
+
+
+@st.cache_data(ttl=1800,show_spinner=False)
+def vertical_data():
+    rows=[]
+    errors=[]
+    for name,model in MODELS.items():
         try:
-            data=request_json("https://api.open-meteo.com/v1/forecast",{
-                "latitude":AIRPORTS[airport][1],"longitude":AIRPORTS[airport][2],
-                "hourly":",".join(FIELDS),"models":code,"forecast_days":2,"timezone":"UTC"})
+            data=fetch("https://api.open-meteo.com/v1/forecast",{
+                "latitude":STATION["latitude"],"longitude":STATION["longitude"],
+                "models":model,"hourly":",".join(PROFILE_FIELDS),
+                "forecast_days":2,"timezone":"UTC"})
             hourly=data.get("hourly",{})
             for i,t in enumerate(hourly.get("time",[])):
-                valid=timestamp(t+"+00:00")
-                if not valid:continue
-                hours=(datetime.fromisoformat(valid)-datetime.fromisoformat(now)).total_seconds()/3600
-                if hours < -1 or hours > 30:continue
-                for field in FIELDS:
-                    values=hourly.get(field,[])
-                    v=asfloat(values[i]) if i<len(values) else None
-                    if v is not None:
-                        c.execute("INSERT OR IGNORE INTO forecasts VALUES(?,?,?,?,?,?)",
-                                  (airport,name,now,valid,field,v))
-        except Exception as e:errors.append(name+": "+str(e))
-    c.commit()
-    return metars,tafs,errors
+                candidates=saturated_level_candidates(hourly,i,STATION["elevation_ft"])
+                bands=moisture_bands(candidates)
+                rows.append({"valid_at":pd.to_datetime(t,utc=True),"model":name,
+                             "lowest_moist_level_ft_agl":lowest_candidate_ft(candidates),
+                             "possible_moist_bands":len(bands),
+                             "moist_band_indicators":", ".join(
+                                 str(b["base_indicator_ft_agl"])+"-"+str(b["top_indicator_ft_agl"])+" ft"
+                                 for b in bands) if bands else "None detected"})
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    return pd.DataFrame(rows),errors
 
-def latest_forecasts(c,airport):
-    return pd.read_sql_query("""
-    SELECT f.* FROM forecasts f JOIN
-    (SELECT model,MAX(fetched_at) AS newest FROM forecasts WHERE airport=? GROUP BY model) r
-    ON f.model=r.model AND f.fetched_at=r.newest WHERE f.airport=?
-    """,c,params=(airport,airport))
+@st.cache_data(ttl=300,show_spinner=False)
+def metar_data():
+    data=fetch("https://aviationweather.gov/api/data/metar",
+               {"ids":"KDLF","format":"json","hours":3})
+    if not isinstance(data,list):return None
+    return max(data,key=lambda m: str(m.get("obsTime") or "")) if data else None
 
-def verification(c,airport):
-    obs=pd.read_sql_query("SELECT * FROM observations WHERE airport=?",c,params=(airport,))
-    forecasts=pd.read_sql_query("SELECT * FROM forecasts WHERE airport=? AND variable IN ('temperature_2m','wind_speed_10m')",c,params=(airport,))
-    if obs.empty or forecasts.empty:return pd.DataFrame()
-    rows=[]
-    obs["observed_at"]=pd.to_datetime(obs.observed_at,utc=True)
-    forecasts["valid_at"]=pd.to_datetime(forecasts.valid_at,utc=True)
-    forecasts["fetched_at"]=pd.to_datetime(forecasts.fetched_at,utc=True)
-    for _,o in obs.iterrows():
-        for var,observed in [("temperature_2m",o["temp"]),("wind_speed_10m",o["wind_kt"]*1.852 if pd.notna(o["wind_kt"]) else None)]:
-            if pd.isna(observed):continue
-            f=forecasts[(forecasts.variable==var)&(forecasts.fetched_at<=o.observed_at)].copy()
-            if f.empty:continue
-            f["minutes"]=(f.valid_at-o.observed_at).abs().dt.total_seconds()/60
-            f=f[f.minutes<=35]
-            if f.empty:continue
-            for model,g in f.groupby("model"):
-                best=g.sort_values(["minutes","fetched_at"],ascending=[True,False]).iloc[0]
-                lead=(best.valid_at-best.fetched_at).total_seconds()/3600
-                rows.append({"Model":model,"Variable":var,"Lead (h)":round(lead,1),
-                             "Absolute error":abs(float(best.value)-float(observed)),
-                             "Observation":o.observed_at})
-    return pd.DataFrame(rows)
+def observed_layers(metar):
+    """Extract only explicitly reported METAR cloud layers."""
+    layers=[]
+    if not metar:return layers
+    for item in metar.get("clouds",[]) or []:
+        cover=str(item.get("cover","")).upper()
+        base=item.get("base")
+        if cover in ("FEW","SCT","BKN","OVC") and base is not None:
+            layers.append({"Coverage":cover,"Base (ft AGL)":base,"Source":"Observed METAR"})
+    if layers:return layers
+    raw=metar.get("rawOb","")
+    for cover,hundreds in re.findall(r"\b(FEW|SCT|BKN|OVC)(\d{3})(?:CB|TCU)?\b",raw):
+        layers.append({"Coverage":cover,"Base (ft AGL)":int(hundreds)*100,"Source":"Observed METAR"})
+    return layers
 
-st.set_page_config(page_title="Aviation Weather Intelligence",page_icon="✈️",layout="wide")
-st.markdown("""<style>
-.block-container{max-width:1050px;padding-top:1.2rem;padding-bottom:2rem}
-h1{font-size:clamp(2rem,6vw,3.2rem)!important;line-height:1.15!important}
-h2,h3{letter-spacing:-.02em}
-div[data-testid="stMetric"]{background:rgba(125,145,180,.09);border:1px solid rgba(125,145,180,.20);border-radius:14px;padding:14px}
-div[data-testid="stAlert"]{border-radius:12px}
-.stButton button[kind="primary"]{border-radius:12px;font-weight:650}
-</style>""",unsafe_allow_html=True)
-st.markdown("""<style>.block-container{max-width:1050px;padding-top:1.2rem}h1{font-size:clamp(2rem,6vw,3rem)!important}div[data-testid="stMetric"]{border:1px solid #52607355;border-radius:12px;padding:12px}</style>""",unsafe_allow_html=True)
-st.title("✈️ Aviation Weather Intelligence")
-st.caption("30-hour experimental aviation forecast dashboard · not an official TAF service")
-airport=st.sidebar.selectbox("Airport",list(AIRPORTS),format_func=lambda a:a+" — "+AIRPORTS[a][0])
-c=connect()
-if st.sidebar.button("Refresh live weather",type="primary") or ("last_"+airport not in st.session_state):
-    with st.spinner("Collecting METAR, TAF and model forecasts..."):
-        metars,tafs,errors=ingest(c,airport)
-        st.session_state["errors_"+airport]=errors
-        st.session_state["last_"+airport]=datetime.now(timezone.utc).isoformat()
-st.subheader(airport+" — "+AIRPORTS[airport][0])
-st.caption("Last refresh: "+st.session_state.get("last_"+airport,"Not refreshed this session"))
-st.markdown("### Current airport overview")
-obs=pd.read_sql_query("SELECT * FROM observations WHERE airport=? ORDER BY observed_at DESC LIMIT 1",c,params=(airport,))
-taf=pd.read_sql_query("SELECT * FROM tafs WHERE airport=? ORDER BY fetched_at DESC LIMIT 1",c,params=(airport,))
-if not obs.empty:
-    current=obs.iloc[0]
-    m1,m2,m3=st.columns(3)
-    m1.metric("Temperature",f"{current['temp']:.0f} °C" if pd.notna(current['temp']) else "N/A")
-    m2.metric("Wind",f"{current['wind_kt']:.0f} kt" if pd.notna(current['wind_kt']) else "N/A")
-    m3.metric("Station",airport)
-left,right=st.columns(2)
-with left:
-    st.markdown("#### Latest archived METAR")
-    if obs.empty:st.info("No airport METAR yet. No nearby station is substituted.")
+def observed_ceiling(layers):
+    heights=[x["Base (ft AGL)"] for x in layers if x["Coverage"] in ("BKN","OVC")]
+    return min(heights) if heights else None
+
+st.set_page_config(page_title="KDLF Cloud Intelligence",page_icon="☁️",layout="wide")
+st.title("☁️ KDLF Cloud Intelligence")
+st.caption("Experimental model guidance · NOT an official aviation forecast or approved operational weather product")
+st.info("Only models returning usable data contribute to cloud-cover averages. Vertical moisture indicators are NOT validated cloud bases or aviation ceilings. Consult official aviation weather products for operational decisions.")
+if st.button("Refresh observations and models"):
+    model_data.clear()
+    vertical_data.clear()
+    metar_data.clear()
+try:
+    metar=metar_data()
+except Exception as exc:
+    metar=None
+    st.warning(f"METAR feed unavailable: {exc}")
+if metar:
+    st.subheader("Latest KDLF observation")
+    st.code(metar.get("rawOb","Raw report unavailable"))
+    layers=observed_layers(metar)
+    if layers:
+        st.dataframe(pd.DataFrame(layers),hide_index=True,use_container_width=True)
+        ceiling=observed_ceiling(layers)
+        st.metric("Observed ceiling",f"{ceiling:,} ft AGL" if ceiling is not None else "No BKN/OVC layer reported")
     else:
-        st.code(obs.iloc[0]["raw"])
-        st.caption("Observed: "+obs.iloc[0]["observed_at"])
-with right:
-    st.markdown("#### Latest archived official TAF")
-    if taf.empty:st.info("No TAF available.")
-    else:st.code(taf.iloc[0]["raw"])
-st.markdown("### 30-hour multi-model forecast")
-f=latest_forecasts(c,airport)
-if f.empty:st.info("Press Refresh live weather to load model guidance.")
+        st.caption("No explicit cloud layers parsed from this METAR. Ceiling unavailable.")
 else:
-    variable=st.selectbox("Forecast variable",FIELDS)
-    selected=f[f.variable==variable].copy()
-    selected["valid_at"]=pd.to_datetime(selected.valid_at,utc=True)
-    fig=px.line(selected.sort_values("valid_at"),x="valid_at",y="value",color="model",markers=True)
-    if variable in ("cloud_cover","precipitation_probability"):fig.update_yaxes(range=[0,100])
-    fig.update_layout(height=360,margin=dict(l=5,r=5,t=10,b=5),hovermode="x unified")
-    st.plotly_chart(fig,use_container_width=True)
-    st.dataframe(selected[["model","valid_at","value"]],hide_index=True,use_container_width=True)
-st.markdown("---")
-st.markdown("## 📝 Generate a TAF planning draft")
-st.caption("Choose a local Central Time start date and hour. The app uses available model guidance to create a conservative 3-hourly planning outline. It does not invent missing sky layers or weather phenomena.")
-tz=ZoneInfo("America/Chicago")
-local_now=datetime.now(tz)
-with st.form("generate_taf"):
-    a,b=st.columns(2)
-    with a:
-        chosen_date=st.date_input("Forecast start date (Central Time)",value=local_now.date(),key="draft_date")
-    with b:
-        chosen_hour=st.selectbox("Forecast start hour (Central Time)",list(range(24)),index=local_now.hour,format_func=lambda h:f"{h:02d}:00",key="draft_hour")
-    duration=st.selectbox("Requested duration",options=[6,12,18,24,30],index=3,format_func=lambda h:f"{h} hours")
-    make=st.form_submit_button("Generate draft from model guidance",type="primary",use_container_width=True)
-if make:
-    selected_local=datetime.combine(chosen_date,time(chosen_hour),tzinfo=tz)
-    draft_text,warnings=build_draft(airport,f,selected_local.astimezone(timezone.utc),duration)
-    st.session_state["generated_"+airport]=draft_text
-    st.session_state["warnings_"+airport]=warnings
-generated=st.session_state.get("generated_"+airport)
-if generated:
-    st.code(generated,language=None)
-    st.download_button("Download planning draft",data=generated,file_name=f"{airport}_planning_draft.txt",mime="text/plain")
-for warning in st.session_state.get("warnings_"+airport,[]):
-    st.caption("⚠️ "+warning)
-st.markdown("---")
-st.markdown("---")
-st.markdown("## 📝 Generate a TAF planning draft")
-st.caption("Select a forecast start in Central Time. This creates an experimental 3-hourly planning outline, not an official TAF.")
-tz=ZoneInfo("America/Chicago")
-local_now=datetime.now(tz)
-with st.form("generate_taf"):
-    chosen_date=st.date_input("Start date (Central Time)",value=local_now.date())
-    chosen_hour=st.selectbox("Start hour (Central Time)",list(range(24)),index=local_now.hour,format_func=lambda h:f"{h:02d}:00")
-    duration=st.selectbox("Duration",options=[6,12,18,24,30],index=3,format_func=lambda h:f"{h} hours")
-    make=st.form_submit_button("Generate planning draft",type="primary",use_container_width=True)
-if make:
-    selected_local=datetime.combine(chosen_date,time(chosen_hour),tzinfo=tz)
-    draft_text,warnings=build_draft(airport,f,selected_local.astimezone(timezone.utc),duration)
-    st.session_state["generated_"+airport]=draft_text
-    st.session_state["warnings_"+airport]=warnings
-generated=st.session_state.get("generated_"+airport)
-if generated:
-    st.code(generated,language=None)
-    st.download_button("Download planning draft",data=generated,file_name=f"{airport}_planning_draft.txt",mime="text/plain")
-for warning in st.session_state.get("warnings_"+airport,[]):
-    st.caption("⚠️ "+warning)
-st.markdown("---")
-st.markdown("### Forecast verification")
-scores=verification(c,airport)
-if scores.empty:st.info("Collect multiple refreshes over time to match past forecasts against subsequent METARs.")
+    st.warning("No KDLF METAR returned; no nearby station is substituted.")
+
+st.subheader("Hourly model cloud coverage — next 30 hours")
+df,errors,feed_status=model_data()
+now=pd.Timestamp.now(tz="UTC")
+if df.empty:
+    st.error("No model cloud guidance is available.")
 else:
-    summary=scores.groupby(["Model","Variable"]).agg(MAE=("Absolute error","mean"),Cases=("Absolute error","count")).reset_index()
+    df=df[(df.valid_at>=now.floor("h"))&(df.valid_at<=now+pd.Timedelta(hours=30))].copy()
+    if df.empty:
+        st.warning("No forecast hours remain in the 30-hour window.")
+        st.stop()
+    coverage=st.selectbox("Cloud category",CLOUD_FIELDS,format_func=lambda x:{
+        "cloud_cover":"Total cloud cover","cloud_cover_low":"Low clouds",
+        "cloud_cover_mid":"Middle clouds","cloud_cover_high":"High clouds"}[x])
+    graph=df[["valid_at","model",coverage]].dropna()
+    if not graph.empty:
+        fig=px.line(graph,x="valid_at",y=coverage,color="model",markers=True)
+        fig.update_yaxes(range=[0,100],title="Cloud cover (%)")
+        fig.update_xaxes(title="Valid time (UTC)")
+        st.plotly_chart(fig,use_container_width=True)
+    summary=df.groupby("valid_at",as_index=False)[CLOUD_FIELDS].mean(numeric_only=True)
+    summary=summary.rename(columns={
+        "valid_at":"UTC hour","cloud_cover":"Total (%)",
+        "cloud_cover_low":"Low (%)","cloud_cover_mid":"Mid (%)",
+        "cloud_cover_high":"High (%)"})
+    proxy=metar_total_cloud_proxy(metar,observed_layers(metar))
+    age=observation_age_hours(metar)
+    summary["METAR-adjusted total (%)"]=[
+        adjust_cloud_cover(row["Total (%)"],proxy,
+                           max(0,(row["UTC hour"]-now).total_seconds()/3600),age)
+        for _,row in summary.iterrows()
+    ]
+    summary["Models reporting total"]=df.dropna(subset=["cloud_cover"]).groupby("valid_at")["model"].nunique().reindex(summary["UTC hour"]).fillna(0).astype(int).values
+    summary["Forecast cloud layers"]="Unavailable — vertical cloud-base data required"
+    summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
-    st.caption("Preliminary scoring: only forecasts collected before observations, matched within 35 minutes. Not yet calibrated.")
-st.markdown("### Internal TAF review workspace")
-st.warning("Human-reviewed drafts only. This app does not issue or automatically amend official TAFs.")
-with st.form("review"):
-    draft=st.text_area("Draft TAF text",value=st.session_state.get("generated_"+airport) or (taf.iloc[0]["raw"] if not taf.empty else ""),height=110)
-    rationale=st.text_area("Review rationale")
-    if st.form_submit_button("Save internal review"):
-        if draft.strip():
-            c.execute("INSERT INTO reviews VALUES(?,?,?,?)",(airport,datetime.now(timezone.utc).isoformat(),draft,rationale))
-            c.commit();st.success("Saved review record.")
-        else:st.error("Enter draft text.")
-with st.expander("Data feed errors"):
-    st.write(st.session_state.get("errors_"+airport,[]))
-st.caption("Research tool only. Use approved official aviation sources for operational flight decisions.")
-c.close()
+    st.subheader("Experimental cloud planning outline")
+    start_options=list(summary["UTC hour"])
+    if start_options:
+        chosen=st.selectbox("Planning start (UTC)",start_options,
+                            format_func=lambda x:pd.Timestamp(x).strftime("%d %b %H:%M UTC"))
+        duration=st.slider("Planning duration (hours)",min_value=3,max_value=30,value=24,step=3)
+        outline=planning_outline(summary.to_dict("records"),
+                                 start=pd.Timestamp(chosen).to_pydatetime(),
+                                 duration_hours=duration)
+        st.code(outline,language="text")
+        st.download_button("Download planning outline",data=outline,
+                           file_name="KDLF_experimental_cloud_outline.txt",mime="text/plain")
+    st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR-adjusted total cover is an experimental near-term nudge based on observed sky category, not measured cloud percentage; adjustment fades by +6h. Cloud heights require vertical profile data.")
+
+st.subheader("Experimental vertical moisture guidance")
+st.caption("Pressure levels with relative humidity at least 90% are grouped into tentative moist-altitude bands. Boundaries are sampled pressure-level indicators, NOT cloud bases, cloud tops, or aviation ceilings.")
+vertical,profile_errors=vertical_data()
+if not vertical.empty:
+    vertical=vertical[(vertical.valid_at>=now.floor("h"))&(vertical.valid_at<=now+pd.Timedelta(hours=30))]
+    moist=vertical.dropna(subset=["lowest_moist_level_ft_agl"])
+    if not moist.empty:
+        fig=px.line(moist,x="valid_at",y="lowest_moist_level_ft_agl",color="model",markers=True)
+        fig.update_yaxes(title="Lowest moist pressure level (ft AGL)")
+        st.plotly_chart(fig,use_container_width=True)
+    st.dataframe(vertical,hide_index=True,use_container_width=True)
+else:
+    st.info("Vertical profile data unavailable.")
+if profile_errors:
+    with st.expander("Vertical model errors"):
+        st.write(profile_errors)
+
+if not feed_status.empty:
+    with st.expander("Model data availability"):
+        st.dataframe(feed_status,hide_index=True,use_container_width=True)
+if errors:
+    with st.expander("Model feed errors"):
+        for err in errors:st.write(err)
+st.caption("Research use only. Verify operational conditions using approved aviation weather products.")
