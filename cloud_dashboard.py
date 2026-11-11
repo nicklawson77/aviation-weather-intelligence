@@ -12,7 +12,7 @@ import plotly.express as px
 from station_config import active_station
 
 STATION=active_station()
-MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless"}
+MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless","HRRR":"ncep_hrrr_conus","RRFS":"ncep_rrfs_conus"}
 CLOUD_FIELDS=["cloud_cover","cloud_cover_low","cloud_cover_mid","cloud_cover_high"]
 HEADERS={"User-Agent":"AviationWeatherIntelligenceResearch/0.4"}
 
@@ -72,7 +72,7 @@ def observed_ceiling(layers):
 st.set_page_config(page_title="KDLF Cloud Intelligence",page_icon="☁️",layout="wide")
 st.title("☁️ KDLF Cloud Intelligence")
 st.caption("Development prototype · experimental model guidance, not an official aviation forecast")
-st.info("Model cloud coverage is available. Model cloud-base heights and FEW/SCT/BKN/OVC layers are not yet available from these feeds; they are intentionally NOT fabricated.")
+st.info("HRRR is included while available; NOAA is transitioning to RRFS. If HRRR becomes unavailable, it is excluded from the mean and reported in feed errors. Model cloud coverage is available. Model cloud-base heights and FEW/SCT/BKN/OVC layers are not yet available from these feeds; they are intentionally NOT fabricated.")
 if st.button("Refresh observations and models"):
     model_data.clear()
     metar_data.clear()
@@ -118,7 +118,7 @@ else:
     summary["Forecast cloud layers"]="Unavailable — vertical cloud-base data required"
     summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
-    st.caption("Current blend: unweighted mean of available models. METAR is displayed as independent observation; no cloud-cover adjustment is applied until a validated method exists.")
+    st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR is displayed as independent observation; no cloud-cover adjustment is applied until a validated method exists.")
 if errors:
     with st.expander("Model feed errors"):
         for err in errors:st.write(err)
