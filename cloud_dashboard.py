@@ -10,12 +10,14 @@ import requests
 import streamlit as st
 import plotly.express as px
 from station_config import active_station
+from vertical_profile import LEVELS, saturated_level_candidates, lowest_candidate_ft
 from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
 STATION=active_station()
 MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless","HRRR":"ncep_hrrr_conus","RRFS":"ncep_rrfs_conus"}
 CLOUD_FIELDS=["cloud_cover","cloud_cover_low","cloud_cover_mid","cloud_cover_high"]
 HEADERS={"User-Agent":"AviationWeatherIntelligenceResearch/0.4"}
+PROFILE_FIELDS=[f"{field}_{level}hPa" for level in LEVELS for field in ("relative_humidity","geopotential_height")]
 
 def fetch(url,params):
     response=requests.get(url,params=params,headers=HEADERS,timeout=25)
@@ -43,6 +45,26 @@ def model_data():
         except Exception as exc:
             errors.append(f"{name}: {exc}")
     return pd.DataFrame(records),errors
+
+
+@st.cache_data(ttl=1800,show_spinner=False)
+def vertical_data():
+    rows=[]
+    errors=[]
+    for name,model in MODELS.items():
+        try:
+            data=fetch("https://api.open-meteo.com/v1/forecast",{
+                "latitude":STATION["latitude"],"longitude":STATION["longitude"],
+                "models":model,"hourly":",".join(PROFILE_FIELDS),
+                "forecast_days":2,"timezone":"UTC"})
+            hourly=data.get("hourly",{})
+            for i,t in enumerate(hourly.get("time",[])):
+                candidates=saturated_level_candidates(hourly,i,STATION["elevation_ft"])
+                rows.append({"valid_at":pd.to_datetime(t,utc=True),"model":name,
+                             "lowest_moist_level_ft_agl":lowest_candidate_ft(candidates)})
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    return pd.DataFrame(rows),errors
 
 @st.cache_data(ttl=300,show_spinner=False)
 def metar_data():
@@ -76,6 +98,7 @@ st.caption("Development prototype · experimental model guidance, not an officia
 st.info("HRRR is included while available; NOAA is transitioning to RRFS. If HRRR becomes unavailable, it is excluded from the mean and reported in feed errors. Model cloud coverage is available. Model cloud-base heights and FEW/SCT/BKN/OVC layers are not yet available from these feeds; they are intentionally NOT fabricated.")
 if st.button("Refresh observations and models"):
     model_data.clear()
+    vertical_data.clear()
     metar_data.clear()
 try:
     metar=metar_data()
@@ -127,6 +150,24 @@ else:
     summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
     st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR-adjusted total cover is an experimental near-term nudge based on observed sky category, not measured cloud percentage; adjustment fades by +6h. Cloud heights require vertical profile data.")
+
+st.subheader("Experimental vertical moisture guidance")
+st.caption("Pressure levels with relative humidity at least 90% suggest possible cloud-bearing air. Heights shown are moist-level indicators, NOT cloud bases or aviation ceilings.")
+vertical,profile_errors=vertical_data()
+if not vertical.empty:
+    vertical=vertical[(vertical.valid_at>=now.floor("h"))&(vertical.valid_at<=now+pd.Timedelta(hours=30))]
+    moist=vertical.dropna(subset=["lowest_moist_level_ft_agl"])
+    if not moist.empty:
+        fig=px.line(moist,x="valid_at",y="lowest_moist_level_ft_agl",color="model",markers=True)
+        fig.update_yaxes(title="Lowest moist pressure level (ft AGL)")
+        st.plotly_chart(fig,use_container_width=True)
+    st.dataframe(vertical,hide_index=True,use_container_width=True)
+else:
+    st.info("Vertical profile data unavailable.")
+if profile_errors:
+    with st.expander("Vertical model errors"):
+        st.write(profile_errors)
+
 if errors:
     with st.expander("Model feed errors"):
         for err in errors:st.write(err)
