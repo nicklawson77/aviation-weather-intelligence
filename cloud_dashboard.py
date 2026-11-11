@@ -10,6 +10,7 @@ import requests
 import streamlit as st
 import plotly.express as px
 from station_config import active_station
+from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
 STATION=active_station()
 MODELS={"GFS":"ncep_gfs_seamless","ECMWF IFS":"ecmwf_ifs025","ICON":"icon_seamless","HRRR":"ncep_hrrr_conus","RRFS":"ncep_rrfs_conus"}
@@ -115,10 +116,17 @@ else:
         "valid_at":"UTC hour","cloud_cover":"Total (%)",
         "cloud_cover_low":"Low (%)","cloud_cover_mid":"Mid (%)",
         "cloud_cover_high":"High (%)"})
+    proxy=metar_total_cloud_proxy(metar,observed_layers(metar))
+    age=observation_age_hours(metar)
+    summary["METAR-adjusted total (%)"]=[
+        adjust_cloud_cover(row["Total (%)"],proxy,
+                           max(0,(row["UTC hour"]-now).total_seconds()/3600),age)
+        for _,row in summary.iterrows()
+    ]
     summary["Forecast cloud layers"]="Unavailable — vertical cloud-base data required"
     summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
-    st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR is displayed as independent observation; no cloud-cover adjustment is applied until a validated method exists.")
+    st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR-adjusted total cover is an experimental near-term nudge based on observed sky category, not measured cloud percentage; adjustment fades by +6h. Cloud heights require vertical profile data.")
 if errors:
     with st.expander("Model feed errors"):
         for err in errors:st.write(err)
