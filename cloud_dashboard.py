@@ -11,6 +11,7 @@ import streamlit as st
 import plotly.express as px
 from station_config import active_station
 from vertical_profile import LEVELS, saturated_level_candidates, lowest_candidate_ft
+from feed_quality import model_field_status
 from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
 STATION=active_station()
@@ -28,6 +29,7 @@ def fetch(url,params):
 def model_data():
     records=[]
     errors=[]
+    statuses=[]
     for name,model in MODELS.items():
         try:
             data=fetch("https://api.open-meteo.com/v1/forecast",{
@@ -35,6 +37,7 @@ def model_data():
                 "models":model,"hourly":",".join(CLOUD_FIELDS),
                 "forecast_days":2,"timezone":"UTC"})
             hourly=data.get("hourly",{})
+            statuses.append({"Model":name,**model_field_status(hourly,CLOUD_FIELDS)})
             times=hourly.get("time",[])
             for i,t in enumerate(times):
                 record={"valid_at":pd.to_datetime(t,utc=True),"model":name}
@@ -44,7 +47,8 @@ def model_data():
                 records.append(record)
         except Exception as exc:
             errors.append(f"{name}: {exc}")
-    return pd.DataFrame(records),errors
+            statuses.append({"Model":name,"status":"error","hours":0,"available":[],"missing":CLOUD_FIELDS})
+    return pd.DataFrame(records),errors,pd.DataFrame(statuses)
 
 
 @st.cache_data(ttl=1800,show_spinner=False)
@@ -71,7 +75,7 @@ def metar_data():
     data=fetch("https://aviationweather.gov/api/data/metar",
                {"ids":"KDLF","format":"json","hours":3})
     if not isinstance(data,list):return None
-    return data[0] if data else None
+    return max(data,key=lambda m: str(m.get("obsTime") or "")) if data else None
 
 def observed_layers(metar):
     """Extract only explicitly reported METAR cloud layers."""
@@ -119,7 +123,7 @@ else:
     st.warning("No KDLF METAR returned; no nearby station is substituted.")
 
 st.subheader("Hourly model cloud coverage — next 30 hours")
-df,errors=model_data()
+df,errors,feed_status=model_data()
 now=pd.Timestamp.now(tz="UTC")
 if df.empty:
     st.error("No model cloud guidance is available.")
@@ -146,6 +150,7 @@ else:
                            max(0,(row["UTC hour"]-now).total_seconds()/3600),age)
         for _,row in summary.iterrows()
     ]
+    summary["Models reporting total"]=df.dropna(subset=["cloud_cover"]).groupby("valid_at")["model"].nunique().reindex(summary["UTC hour"]).fillna(0).astype(int).values
     summary["Forecast cloud layers"]="Unavailable — vertical cloud-base data required"
     summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
@@ -168,6 +173,9 @@ if profile_errors:
     with st.expander("Vertical model errors"):
         st.write(profile_errors)
 
+if not feed_status.empty:
+    with st.expander("Model data availability"):
+        st.dataframe(feed_status,hide_index=True,use_container_width=True)
 if errors:
     with st.expander("Model feed errors"):
         for err in errors:st.write(err)
