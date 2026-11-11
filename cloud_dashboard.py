@@ -12,6 +12,7 @@ import plotly.express as px
 from station_config import active_station
 from vertical_profile import LEVELS, saturated_level_candidates, lowest_candidate_ft
 from feed_quality import model_field_status
+from moisture_bands import moisture_bands
 from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
 STATION=active_station()
@@ -64,8 +65,13 @@ def vertical_data():
             hourly=data.get("hourly",{})
             for i,t in enumerate(hourly.get("time",[])):
                 candidates=saturated_level_candidates(hourly,i,STATION["elevation_ft"])
+                bands=moisture_bands(candidates)
                 rows.append({"valid_at":pd.to_datetime(t,utc=True),"model":name,
-                             "lowest_moist_level_ft_agl":lowest_candidate_ft(candidates)})
+                             "lowest_moist_level_ft_agl":lowest_candidate_ft(candidates),
+                             "possible_moist_bands":len(bands),
+                             "moist_band_indicators":", ".join(
+                                 str(b["base_indicator_ft_agl"])+"-"+str(b["top_indicator_ft_agl"])+" ft"
+                                 for b in bands) if bands else "None detected"})
         except Exception as exc:
             errors.append(f"{name}: {exc}")
     return pd.DataFrame(rows),errors
@@ -157,7 +163,7 @@ else:
     st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR-adjusted total cover is an experimental near-term nudge based on observed sky category, not measured cloud percentage; adjustment fades by +6h. Cloud heights require vertical profile data.")
 
 st.subheader("Experimental vertical moisture guidance")
-st.caption("Pressure levels with relative humidity at least 90% suggest possible cloud-bearing air. Heights shown are moist-level indicators, NOT cloud bases or aviation ceilings.")
+st.caption("Pressure levels with relative humidity at least 90% are grouped into tentative moist-altitude bands. Boundaries are sampled pressure-level indicators, NOT cloud bases, cloud tops, or aviation ceilings.")
 vertical,profile_errors=vertical_data()
 if not vertical.empty:
     vertical=vertical[(vertical.valid_at>=now.floor("h"))&(vertical.valid_at<=now+pd.Timedelta(hours=30))]
