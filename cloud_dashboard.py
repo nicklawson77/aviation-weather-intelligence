@@ -13,6 +13,7 @@ from station_config import active_station
 from vertical_profile import LEVELS, saturated_level_candidates, lowest_candidate_ft
 from feed_quality import model_field_status
 from moisture_bands import moisture_bands
+from planning_outline import planning_outline
 from cloud_observation import metar_total_cloud_proxy, observation_age_hours, adjust_cloud_cover
 
 STATION=active_station()
@@ -160,6 +161,18 @@ else:
     summary["Forecast cloud layers"]="Unavailable — vertical cloud-base data required"
     summary["Forecast ceiling (ft AGL)"]="Unavailable"
     st.dataframe(summary,hide_index=True,use_container_width=True)
+    st.subheader("Experimental cloud planning outline")
+    start_options=list(summary["UTC hour"])
+    if start_options:
+        chosen=st.selectbox("Planning start (UTC)",start_options,
+                            format_func=lambda x:pd.Timestamp(x).strftime("%d %b %H:%M UTC"))
+        duration=st.slider("Planning duration (hours)",min_value=3,max_value=30,value=24,step=3)
+        outline=planning_outline(summary.to_dict("records"),
+                                 start=pd.Timestamp(chosen).to_pydatetime(),
+                                 duration_hours=duration)
+        st.code(outline,language="text")
+        st.download_button("Download planning outline",data=outline,
+                           file_name="KDLF_experimental_cloud_outline.txt",mime="text/plain")
     st.caption("Current blend: unweighted mean of available models (including HRRR and RRFS when available). METAR-adjusted total cover is an experimental near-term nudge based on observed sky category, not measured cloud percentage; adjustment fades by +6h. Cloud heights require vertical profile data.")
 
 st.subheader("Experimental vertical moisture guidance")
